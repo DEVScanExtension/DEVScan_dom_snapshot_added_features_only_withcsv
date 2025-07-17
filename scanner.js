@@ -15,11 +15,7 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const stealth = StealthPlugin();
 puppeteer.use(stealth);
 
-const SCRAPER_API_PROXY_HOST = 'proxy-server.scraperapi.com:8001';
-const SCRAPER_API_PROXY_USER = 'scraperapi';
-const SCRAPER_API_PROXY_PASS = '81bef26341bebf35a9990bd0fe588682';
-
-
+const SCRAPER_API_PROXY_PASS = '6f976c18de966213f8eb1a8833452180';
 
 let browser;
 async function launchBrowser(proxy = null) {
@@ -74,16 +70,15 @@ export const getDomFeatures = async (page, url, userAgent) => {
   // await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
   } catch (_) {
     try {
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 120000 });
     } catch (e) {
       throw new Error(`Navigation failed (fallback too): ${e.message}`);
     }
 }
  // trial changes
-  await delay(2000);
 
   const tagCounts = await safeEval(() => {
     const counts = {};
@@ -260,12 +255,12 @@ async function tryScan(page, url, sslBypass, userAgent) {
   return await getDomFeatures(page, url, userAgent);
 }
 
-export const scanUrls = async (urls, concurrencyLimit = 10) => {
+export const scanUrls = async (urls, concurrencyLimit = 7) => {
   const limit = pLimit(concurrencyLimit);
   const results = {};
   const errorLog = [];
 
-  await launchBrowser(); // Launch default browser (no proxy)
+  await launchBrowser();
 
   async function scanWithRetry(originalUrl) {
     const baseUrl = originalUrl.replace('://www.', '://');
@@ -277,13 +272,10 @@ export const scanUrls = async (urls, concurrencyLimit = 10) => {
     ];
 
     const proxyRetryErrors = [
-      'net::ERR_NAME_NOT_RESOLVED',
-      'net::ERR_CONNECTION_TIMED_OUT',
-      'net::ERR_CONNECTION_RESET',
-      'net::ERR_CONNECTION_CLOSED',
       'net::ERR_BLOCKED_BY_CLIENT',
       'net::ERR_CONNECTION_REFUSED',
-      'ERR_SSL_VERSION_OR_CIPHER_MISMATCH'
+      'ERR_SSL_VERSION_OR_CIPHER_MISMATCH',
+      'net::ERR_SSL_PROTOCOL_ERROR'
     ];
 
     let userAgent = new UserAgent().toString();
@@ -294,36 +286,24 @@ export const scanUrls = async (urls, concurrencyLimit = 10) => {
       let page;
       try {
         page = await browser.newPage();
-        // Short delay to stabilize - trial changes
         await delay(2000);
-        const target = await browser.waitForTarget(t => t.type() === 'page' && t.url() === 'about:blank', { timeout: 3000 });
-          if (!target) throw new Error('Page target did not stabilize.');
-
-        // Block other unnecessary data
         await page.setRequestInterception(true);
         page.on('request', req => {
           const type = req.resourceType();
-          if (["image", "stylesheet", "font"].includes(type)) return req.abort();
-          req.continue();
+          if (["image", "stylesheet", "font"].includes(type)) req.abort();
+          else req.continue();
         });
 
-        // For the system navigation
-        // page.on('framenavigated', frame => {
-        //   console.warn(`⚠️ Frame navigated: ${frame.url()}`);
-        // });
-
-        // Scanning of the data
         const features = await tryScan(page, url, sslBypass, userAgent);
         await delay(1000 + Math.random() * 500);
         await page.close();
 
-        // Return the gathered data
-        return { features, 
-          finalUrl: url, 
-          sslBypassUsed: 
-          sslBypass ? 1 : 0, 
-          usedProxy: false, 
-          userAgent 
+        return {
+          features,
+          finalUrl: url,
+          sslBypassUsed: sslBypass ? 1 : 0,
+          usedProxy: false,
+          userAgent
         };
 
       } catch (err) {
@@ -340,61 +320,47 @@ export const scanUrls = async (urls, concurrencyLimit = 10) => {
       }
     }
 
-    // If all default scans failed and proxy-related error found
     if (proxyNeeded) {
-      console.warn(`🌐 Retrying ${originalUrl} with ScraperAPI proxy`);
-      const proxyArgs = [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--ignore-certificate-errors',
-        '--ignore-ssl-errors',
-        `--proxy-server=${SCRAPER_API_PROXY_HOST}`
-      ];
+      console.warn(`🌐 Retrying ${originalUrl} using ScraperAPI URL proxy`);
 
-      const proxyBrowser = await puppeteer.launch({ headless: 'new', args: proxyArgs });
-
-      for (let { url, sslBypass } of versions) {
+      for (let { url } of versions) {
         let page;
         try {
-          page = await proxyBrowser.newPage();
+          const scraperApiUrl = `http://api.scraperapi.com/?api_key=${SCRAPER_API_PROXY_PASS}&url=${encodeURIComponent(url)}`;
 
-          await page.authenticate({
-            username: SCRAPER_API_PROXY_USER,
-            password: SCRAPER_API_PROXY_PASS
-          });
-          
-          await delay(1000);
+          page = await browser.newPage();
           await page.setRequestInterception(true);
           page.on('request', req => {
-            if (["image", "stylesheet", "font"].includes(req.resourceType())) req.abort();
+            const type = req.resourceType();
+            if (["image", "stylesheet", "font"].includes(type)) req.abort();
             else req.continue();
           });
 
-          const features = await tryScan(page, url, sslBypass, userAgent);
+          const features = await tryScan(page, scraperApiUrl, false, userAgent);
           await delay(1000 + Math.random() * 500);
           await page.close();
-          await proxyBrowser.close();
-          return { features, finalUrl: url, sslBypassUsed: sslBypass ? 1 : 0, usedProxy: true, userAgent };
 
+          return {
+            features,
+            finalUrl: url,
+            sslBypassUsed: 0,
+            usedProxy: true,
+            userAgent
+          };
         } catch (err) {
-          errorMsgs.push(`Proxy ${sslBypass ? 'SSL Bypass' : 'Try'}: ${err.message} at ${url}`);
+          errorMsgs.push(`ScraperAPI (fallback): ${err.message} at ${url}`);
         } finally {
           if (page) await page.close().catch(() => {});
         }
       }
-
-      await proxyBrowser.close();
     }
 
-    throw new Error(errorMsgs.join(' | '));
+    throw new Error(errorMsgs.map(msg => `- ${msg}`).join('\n'));
   }
 
   const tasks = urls.map(({ url, label }) =>
     limit(async () => {
       try {
-        console.log(`✅ Scanning: ${url}`);
         const { features, finalUrl, sslBypassUsed, usedProxy, userAgent } = await scanWithRetry(url);
         results[url] = {
           ...features,
@@ -403,6 +369,7 @@ export const scanUrls = async (urls, concurrencyLimit = 10) => {
           finalUrlTried: finalUrl,
           label
         };
+        console.log(`✅ Scanned: ${url}`);
       } catch (err) {
         console.error(`❌ Error scanning ${url}: ${err.message}`);
         results[url] = { error: err.message, label };
@@ -420,3 +387,4 @@ export const scanUrls = async (urls, concurrencyLimit = 10) => {
   await writeResultsToCsv(getCsvFilePath(), results);
   return results;
 };
+

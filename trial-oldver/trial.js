@@ -1,22 +1,36 @@
-// Combined and corrected version: does 4 original scans first, then retries proxy scans with separate browser instance
-
+// scanner.js
 import path from 'path';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import pLimit from 'p-limit';
+import axios from 'axios'; // ✅ changed from require
+import UserAgent from 'user-agents';
 import {
   writeResultsToCsv,
   writeErrorLogToCsv,
   getCsvFilePath
 } from './csv-utils.js';
-import UserAgent from 'user-agents';
+
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-puppeteer.use(StealthPlugin());
+const stealth = StealthPlugin();
+puppeteer.use(stealth);
 
-const SCRAPER_API_PROXY = 'scraperapi:APIKEY@proxy-server.scraperapi.com:8001';
+// const SCRAPER_API_PROXY_HOST = 'proxy-server.scraperapi.com:8001';
+const API_PROXY_USER = 'opvyweoe';
+const API_PROXY_PASS = '1hy15yt1q57o';
+
+const API_PROXY_HOST = [
+  '38.154.227.167:5868',
+  '92.113.242.158:6742',
+  '23.95.150.145:6114',
+  '198.23.239.134:6540',
+  '207.244.217.165:6712'
+];
+
 
 let browser;
+
 async function launchBrowser(proxy = null) {
   if (browser) {
     try {
@@ -33,18 +47,24 @@ async function launchBrowser(proxy = null) {
     '--ignore-ssl-errors'
   ];
 
-  if (proxy) {
-    args.push(`--proxy-server=${proxy}`);
-  }
+  if (proxy) args.push(`--proxy-server=${proxy}`);
 
   browser = await puppeteer.launch({
     headless: 'new',
-    args
+    args,
+    protocolTimeout: 120000
   });
 }
 
-
 export const getDomFeatures = async (page, url, userAgent) => {
+  const safeEval = async (fn, fallback) => {
+    try {
+      return await page.evaluate(fn);
+    } catch {
+      return fallback;
+    }
+  };
+
   try {
     if (!page.isClosed()) {
       await page.setUserAgent(userAgent);
@@ -56,115 +76,188 @@ export const getDomFeatures = async (page, url, userAgent) => {
   await page.setViewport({ width: 1366, height: 768 });
   await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
   await page.setJavaScriptEnabled(true);
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-  const features = await page.evaluate(() => {
-    const tagCounts = () => {
-      const counts = {};
-      const els = document.querySelectorAll('*');
-      els.forEach(el => {
-        const tag = el.tagName;
-        counts[tag] = (counts[tag] || 0) + 1;
-      });
-      return { totalNodes: els.length, uniqueTags: Object.keys(counts).length };
-    };
-    const countInlineJS = () => {
-      let handlers = 0, hrefJS = 0;
-      document.querySelectorAll('*').forEach(el => {
-        handlers += [...el.attributes].filter(a => a.name.startsWith('on')).length;
-        if (typeof el.href === 'string' && el.href.startsWith('javascript:')) hrefJS++;
-      });
-      return { inlineEventHandlers: handlers, javascriptHref: hrefJS };
-    };
-    const countLoginForms = () => {
-      const forms = document.forms;
-      let loginCount = 0;
-      let externalFormActionBinary = 0;
-      let externalFormActionNonBinary = 0;
+  await delay(500);
+  // await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-      const suspiciousExtensions = ['.php', '.exe', '.bin', '.dll', '.js'];
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  } catch (_) {
+    try {
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+    } catch (e) {
+      throw new Error(`Navigation failed (fallback too): ${e.message}`);
+    }
+}
+ // trial changes
+  await delay(2000);
 
-      [...forms].forEach(form => {
-        const hasPassword = [...form.elements].some(el => el.type === 'password');
-        const action = form.action || '';
-        const isExternal = action && !action.includes(location.hostname);
-        const isBinary = suspiciousExtensions.some(ext => action.endsWith(ext));
+  const tagCounts = await safeEval(() => {
+    const counts = {};
+    const els = document.querySelectorAll('*');
+    els.forEach(el => {
+      const tag = el.tagName;
+      counts[tag] = (counts[tag] || 0) + 1;
+    });
+    return {
+      totalNodes: els.length,
+      uniqueTags: Object.keys(counts).length
+    };
+  }, { totalNodes: -1, uniqueTags: -1 });
 
-        if (hasPassword) loginCount++;
-        if (hasPassword && isExternal && isBinary) externalFormActionBinary++;
-        if (hasPassword && isExternal && !isBinary) externalFormActionNonBinary++;
-      });
+  const inlineJS = await safeEval(() => {
+    let handlers = 0, hrefJS = 0;
+    document.querySelectorAll('*').forEach(el => {
+      handlers += [...el.attributes].filter(a => a.name.startsWith('on')).length;
+      if (typeof el.href === 'string' && el.href.startsWith('javascript:')) hrefJS++;
+    });
+    return {
+      inlineEventHandlers: handlers,
+      javascriptHref: hrefJS
+    };
+  }, { inlineEventHandlers: -1, javascriptHref: -1 });
 
-      const passwordCount = document.querySelectorAll('input[type="password"]').length;
+  const loginForms = await safeEval(() => {
+    const forms = document.forms;
+    let loginCount = 0;
+    let externalFormActionBinary = 0;
+    let externalFormActionNonBinary = 0;
 
-      return {
-        loginFormCount: loginCount,
-        passwordFieldCount: passwordCount,
-        externalFormActionBinary,
-        externalFormActionNonBinary
-      };
-    };
-    const detectSuspiciousKeywords = () => {
-      const keywords = ['eval(', 'document.write', 'atob(', 'setTimeout(', 'setInterval(', 'iframe', 'unescape'];
-      let suspicious = 0;
-      document.querySelectorAll('script').forEach(s => {
-        if (keywords.some(k => s.textContent.includes(k))) suspicious++;
-      });
-      return { suspiciousKeywords: suspicious };
-    };
-    const countHiddenIframes = () => {
-      let hidden = 0;
-      document.querySelectorAll('iframe').forEach(iframe => {
-        const style = window.getComputedStyle(iframe);
-        if (style.display === 'none' || style.visibility === 'hidden') hidden++;
-      });
-      return { hiddenIframeCount: hidden };
-    };
-    const countSuspiciousScripts = () => {
-      const suspiciousSrc = ['.php', 'eval', 'base64', 'unescape'];
-      let suspicious = 0;
-      document.querySelectorAll('script').forEach(script => {
-        if (suspiciousSrc.some(word => (script.src || '').includes(word))) suspicious++;
-      });
-      return { suspiciousScriptTags: suspicious };
-    };
-    const additionalFeatures = () => {
-      const metaTags = document.querySelectorAll('meta').length;
-      const scripts = [...document.querySelectorAll('script')];
-      const externalScripts = scripts.filter(s => s.src).length;
-      const inlineScripts = scripts.length - externalScripts;
-      const externalLinks = [...document.querySelectorAll('a')].filter(a => a.href && !a.href.includes(location.hostname)).length;
-      const embeddedObjects = document.querySelectorAll('embed, object').length;
-      const suspiciousInlineStyles = [...document.querySelectorAll('*')].filter(el => /display\s*:\s*none|visibility\s*:\s*hidden/i.test(el.getAttribute('style') || '')).length;
-      const suspiciousLinkCount = [...document.querySelectorAll('a')].filter(a => /\.php|\.exe|base64/i.test(a.href || '')).length;
-      return {
-        metaTagCount: metaTags,
-        externalScriptCount: externalScripts,
-        inlineScriptCount: inlineScripts,
-        externalLinkCount: externalLinks,
-        embeddedObjectCount: embeddedObjects,
-        suspiciousInlineStyleCount: suspiciousInlineStyles,
-        suspiciousLinkCount
-      };
-    };
+    const suspiciousExtensions = ['.php', '.exe', '.bin', '.dll', '.js'];
+
+    [...forms].forEach(form => {
+      const hasPassword = [...form.elements].some(el => el.type === 'password');
+      const rawAction = form.action || '';
+      const actionStr = typeof rawAction === 'string' ? rawAction : String(rawAction);
+      const isExternal = actionStr && !actionStr.includes(location.hostname);
+      const isBinary = suspiciousExtensions.some(ext => actionStr.endsWith(ext));
+
+      if (hasPassword) loginCount++;
+      if (hasPassword && isExternal && isBinary) externalFormActionBinary++;
+      if (hasPassword && isExternal && !isBinary) externalFormActionNonBinary++;
+    });
+
+    const passwordCount = document.querySelectorAll('input[type="password"]').length;
 
     return {
-      ...tagCounts(),
-      ...countInlineJS(),
-      ...countLoginForms(),
-      ...detectSuspiciousKeywords(),
-      ...countHiddenIframes(),
-      ...countSuspiciousScripts(),
-      ...additionalFeatures(),
+      loginFormCount: loginCount,
+      passwordFieldCount: passwordCount,
+      externalFormActionBinary,
+      externalFormActionNonBinary
+    };
+  }, {
+    loginFormCount: -1,
+    passwordFieldCount: -1,
+    externalFormActionBinary: -1,
+    externalFormActionNonBinary: -1
+  });
+
+  const suspiciousKeywords = await safeEval(() => {
+    const keywords = ['eval(', 'document.write', 'atob(', 'setTimeout(', 'setInterval(', 'iframe', 'unescape'];
+    let suspicious = 0;
+    document.querySelectorAll('script').forEach(s => {
+      if (keywords.some(k => s.textContent.includes(k))) suspicious++;
+    });
+    return { suspiciousKeywords: suspicious };
+  }, { suspiciousKeywords: -1 });
+
+  const hiddenIframes = await safeEval(() => {
+    let hidden = 0;
+    document.querySelectorAll('iframe').forEach(iframe => {
+      const style = window.getComputedStyle(iframe);
+      if (style.display === 'none' || style.visibility === 'hidden') hidden++;
+    });
+    return { hiddenIframeCount: hidden };
+  }, { hiddenIframeCount: -1 });
+
+  const suspiciousScripts = await safeEval(() => {
+    const suspiciousSrc = ['.php', 'eval', 'base64', 'unescape'];
+    let suspicious = 0;
+    document.querySelectorAll('script').forEach(script => {
+      if (suspiciousSrc.some(word => (script.src || '').includes(word))) suspicious++;
+    });
+    return { suspiciousScriptTags: suspicious };
+  }, { suspiciousScriptTags: -1 });
+
+  const otherFeatures = await safeEval(() => {
+    const metaTags = document.querySelectorAll('meta').length;
+    const scripts = [...document.querySelectorAll('script')];
+    const externalScripts = scripts.filter(s => s.src).length;
+    const inlineScripts = scripts.length - externalScripts;
+    const externalLinks = [...document.querySelectorAll('a')].filter(a => typeof a.href === 'string' && !a.href.includes(location.hostname)).length;
+    const embeddedObjects = document.querySelectorAll('embed, object').length;
+    const suspiciousInlineStyles = [...document.querySelectorAll('*')].filter(el => /display\s*:\s*none|visibility\s*:\s*hidden/i.test(el.getAttribute('style') || '')).length;
+    const suspiciousLinkCount = [...document.querySelectorAll('a')].filter(a => typeof a.href === 'string' && /\.php|\.exe|base64/i.test(a.href)).length;
+
+    return {
+      metaTagCount: metaTags,
+      externalScriptCount: externalScripts,
+      inlineScriptCount: inlineScripts,
+      externalLinkCount: externalLinks,
+      embeddedObjectCount: embeddedObjects,
+      suspiciousInlineStyleCount: suspiciousInlineStyles,
+      suspiciousLinkCount,
       scriptCount: document.scripts.length,
       linkCount: document.links.length,
       iframeCount: document.querySelectorAll('iframe').length,
       formCount: document.forms.length
     };
+  }, {
+    metaTagCount: -1,
+    externalScriptCount: -1,
+    inlineScriptCount: -1,
+    externalLinkCount: -1,
+    embeddedObjectCount: -1,
+    suspiciousInlineStyleCount: -1,
+    suspiciousLinkCount: -1,
+    scriptCount: -1,
+    linkCount: -1,
+    iframeCount: -1,
+    formCount: -1
   });
 
-  return features;
+  const frameNavigationFeatures = await safeEval(() => {
+    const frames = Array.from(window.frames);
+      let navigatedFrameCount = 0;
+      let externalFrameCount = 0;
+      let hasSuspiciousFrameUrl = false;
+
+      const suspiciousIndicators = ['.php', '.exe', 'base64', 'eval'];
+
+        frames.forEach(frame => {
+          try {
+            const frameUrl = frame.location.href;
+            if (frameUrl && frameUrl !== location.href) navigatedFrameCount++;
+            if (frameUrl && !frameUrl.includes(location.hostname)) externalFrameCount++;
+            if (frameUrl && suspiciousIndicators.some(ind => frameUrl.includes(ind))) hasSuspiciousFrameUrl = true;
+          } catch (e) {
+            // cross-origin frame; consider external
+            externalFrameCount++;
+          }
+        });
+
+        return { navigatedFrameCount, 
+          externalFrameCount, 
+          hasSuspiciousFrameUrl: hasSuspiciousFrameUrl ? 1 : 0};
+      }, {
+          navigatedFrameCount: -1,
+          externalFrameCount: -1,
+          hasSuspiciousFrameUrl: -1,
+        });
+
+
+  return {
+    ...tagCounts,
+    ...inlineJS,
+    ...loginForms,
+    ...suspiciousKeywords,
+    ...hiddenIframes,
+    ...suspiciousScripts,
+    ...otherFeatures,
+    ...frameNavigationFeatures
+  };
 };
+
 
 async function tryScan(page, url, sslBypass, userAgent) {
   const client = await page.target().createCDPSession();
@@ -174,7 +267,7 @@ async function tryScan(page, url, sslBypass, userAgent) {
   return await getDomFeatures(page, url, userAgent);
 }
 
-export const scanUrls = async (urls, concurrencyLimit = 5) => {
+export const scanUrls = async (urls, concurrencyLimit = 3) => {
   const limit = pLimit(concurrencyLimit);
   const results = {};
   const errorLog = [];
@@ -194,34 +287,36 @@ export const scanUrls = async (urls, concurrencyLimit = 5) => {
       'net::ERR_NAME_NOT_RESOLVED',
       'net::ERR_CONNECTION_TIMED_OUT',
       'net::ERR_CONNECTION_RESET',
-      'net::ERR_CONNECTION_CLOSED'
+      'net::ERR_CONNECTION_CLOSED',
+      'net::ERR_BLOCKED_BY_CLIENT',
+      'net::ERR_CONNECTION_REFUSED',
+      'ERR_SSL_VERSION_OR_CIPHER_MISMATCH'
     ];
 
     let userAgent = new UserAgent().toString();
     let errorMsgs = [];
     let proxyNeeded = false;
 
-    for (let { url, sslBypass } of versions) {
+    for (const { url, sslBypass } of versions) {
       let page;
       try {
         page = await browser.newPage();
-        await delay(200);
+        await delay(2000);
         await page.setRequestInterception(true);
         page.on('request', req => {
-          if (["image", "stylesheet", "font"].includes(req.resourceType())) req.abort();
-          else req.continue();
+          const type = req.resourceType();
+          if (["image", "stylesheet", "font"].includes(type)) return req.abort();
+          req.continue();
         });
 
         const features = await tryScan(page, url, sslBypass, userAgent);
         await delay(1000 + Math.random() * 500);
         await page.close();
         return { features, finalUrl: url, sslBypassUsed: sslBypass ? 1 : 0, usedProxy: false, userAgent };
-
       } catch (err) {
-        errorMsgs.push(`${sslBypass ? 'SSL Bypass' : 'Try'}: ${err.message} at ${url}`);
+        errorMsgs.push(`Try ${sslBypass ? '(SSL)' : ''}: ${err.message} at ${url}`);
         if (err.message.includes('Protocol error: Connection closed.')) {
-          console.warn(`🔁 Relaunching browser due to closed connection at ${url}`);
-          await delay(3000);
+          console.warn(`🔁 Relaunching browser`);
           await launchBrowser();
         }
         if (proxyRetryErrors.some(e => err.message.includes(e))) proxyNeeded = true;
@@ -230,26 +325,27 @@ export const scanUrls = async (urls, concurrencyLimit = 5) => {
       }
     }
 
-    // If all default scans failed and proxy-related error found
+    // Retry with proxy if needed
     if (proxyNeeded) {
-      console.warn(`🌐 Retrying ${originalUrl} with ScraperAPI proxy`);
-      const proxyArgs = [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--ignore-certificate-errors',
-        '--ignore-ssl-errors',
-        `--proxy-server=${SCRAPER_API_PROXY}`
-      ];
+      const proxyIndex = Math.floor(Math.random() * API_PROXY_HOST.length);
+      const proxy = API_PROXY_HOST[proxyIndex];
 
-      const proxyBrowser = await puppeteer.launch({ headless: 'new', args: proxyArgs });
+      if (!proxy) throw new Error('No working proxy available');
 
-      for (let { url, sslBypass } of versions) {
+      console.warn(`🌐 Retrying ${originalUrl} using proxy: ${proxy}`);
+      await launchBrowser(proxy); // ✅ launch proxied browser
+
+      for (const { url, sslBypass } of versions) {
         let page;
         try {
-          page = await proxyBrowser.newPage();
-          await delay(200);
+          page = await browser.newPage();
+
+          await page.authenticate({
+            username: API_PROXY_USER,
+            password: API_PROXY_PASS
+          });
+
+          await delay(1000);
           await page.setRequestInterception(true);
           page.on('request', req => {
             if (["image", "stylesheet", "font"].includes(req.resourceType())) req.abort();
@@ -259,21 +355,18 @@ export const scanUrls = async (urls, concurrencyLimit = 5) => {
           const features = await tryScan(page, url, sslBypass, userAgent);
           await delay(1000 + Math.random() * 500);
           await page.close();
-          await proxyBrowser.close();
           return { features, finalUrl: url, sslBypassUsed: sslBypass ? 1 : 0, usedProxy: true, userAgent };
-
         } catch (err) {
-          errorMsgs.push(`Proxy ${sslBypass ? 'SSL Bypass' : 'Try'}: ${err.message} at ${url}`);
+          errorMsgs.push(`Proxy ${sslBypass ? '(SSL)' : ''}: ${err.message} at ${url}`);
         } finally {
           if (page) await page.close().catch(() => {});
         }
       }
-
-      await proxyBrowser.close();
     }
 
     throw new Error(errorMsgs.join(' | '));
   }
+
 
   const tasks = urls.map(({ url, label }) =>
     limit(async () => {
@@ -283,9 +376,8 @@ export const scanUrls = async (urls, concurrencyLimit = 5) => {
         results[url] = {
           ...features,
           sslBypassUsed,
-          usedProxy,
+          usedProxy: Number(usedProxy),
           finalUrlTried: finalUrl,
-          userAgent,
           label
         };
       } catch (err) {
@@ -303,7 +395,5 @@ export const scanUrls = async (urls, concurrencyLimit = 5) => {
   } catch (_) {}
 
   await writeResultsToCsv(getCsvFilePath(), results);
-  if (errorLog.length > 0) await writeErrorLogToCsv(errorLog);
-
   return results;
 };
