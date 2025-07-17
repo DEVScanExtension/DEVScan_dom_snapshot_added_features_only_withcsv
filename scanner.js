@@ -15,7 +15,7 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const stealth = StealthPlugin();
 puppeteer.use(stealth);
 
-const SCRAPER_API_PROXY_PASS = '6f976c18de966213f8eb1a8833452180';
+const SCRAPER_API_PROXY_PASS = '9c68321ea50eae9c33cfeb4aed9c1d10';
 
 let browser;
 async function launchBrowser(proxy = null) {
@@ -212,18 +212,21 @@ export const getDomFeatures = async (page, url, userAgent) => {
 
       const suspiciousIndicators = ['.php', '.exe', 'base64', 'eval'];
 
-        frames.forEach(frame => {
-          try {
-            const frameUrl = frame.location.href;
-            if (frameUrl && frameUrl !== location.href) navigatedFrameCount++;
-            if (frameUrl && !frameUrl.includes(location.hostname)) externalFrameCount++;
-            if (frameUrl && suspiciousIndicators.some(ind => frameUrl.includes(ind))) hasSuspiciousFrameUrl = true;
-          } catch (e) {
-            // cross-origin frame; consider external
-            externalFrameCount++;
-          }
-        });
+      for (let i = 0; i < window.frames.length; i++) {
+        try {
+          const frame = window.frames[i];
+          const frameUrl = frame.location.href;
 
+          if (frameUrl && frameUrl !== location.href) navigatedFrameCount++;
+          if (frameUrl && !frameUrl.includes(location.hostname)) externalFrameCount++;
+          if (frameUrl && suspiciousIndicators.some(ind => frameUrl.includes(ind))) {
+            hasSuspiciousFrameUrl = true;
+          }
+        } catch (e) {
+          // Cross-origin or detached frame — treat as external
+          externalFrameCount++;
+        }
+      }
         return { navigatedFrameCount, 
           externalFrameCount, 
           hasSuspiciousFrameUrl: hasSuspiciousFrameUrl ? 1 : 0};
@@ -255,8 +258,9 @@ async function tryScan(page, url, sslBypass, userAgent) {
   return await getDomFeatures(page, url, userAgent);
 }
 
-export const scanUrls = async (urls, concurrencyLimit = 7) => {
+export const scanUrls = async (urls, concurrencyLimit = 10) => {
   const limit = pLimit(concurrencyLimit);
+  const proxyLimit = pLimit(5);
   const results = {};
   const errorLog = [];
 
@@ -274,8 +278,12 @@ export const scanUrls = async (urls, concurrencyLimit = 7) => {
     const proxyRetryErrors = [
       'net::ERR_BLOCKED_BY_CLIENT',
       'net::ERR_CONNECTION_REFUSED',
+      'net::ERR_CONNECTION_TIMED_OUT',
       'ERR_SSL_VERSION_OR_CIPHER_MISMATCH',
-      'net::ERR_SSL_PROTOCOL_ERROR'
+      'net::ERR_SSL_PROTOCOL_ERROR',
+      'net::ERR_SSL_UNRECOGNIZED_NAME_ALERT',
+      'net::ERR_HTTP2_PROTOCOL_ERROR',
+      'net::ERR_CONNECTION_RESET'
     ];
 
     let userAgent = new UserAgent().toString();
@@ -323,36 +331,38 @@ export const scanUrls = async (urls, concurrencyLimit = 7) => {
     if (proxyNeeded) {
       console.warn(`🌐 Retrying ${originalUrl} using ScraperAPI URL proxy`);
 
-      for (let { url } of versions) {
-        let page;
-        try {
-          const scraperApiUrl = `http://api.scraperapi.com/?api_key=${SCRAPER_API_PROXY_PASS}&url=${encodeURIComponent(url)}`;
+      await proxyLimit(async () => {
+        for (let { url } of versions) {
+          let page;
+          try {
+            const scraperApiUrl = `http://api.scraperapi.com/?api_key=${SCRAPER_API_PROXY_PASS}&url=${encodeURIComponent(url)}`;
 
-          page = await browser.newPage();
-          await page.setRequestInterception(true);
-          page.on('request', req => {
-            const type = req.resourceType();
-            if (["image", "stylesheet", "font"].includes(type)) req.abort();
-            else req.continue();
-          });
+            page = await browser.newPage();
+            await page.setRequestInterception(true);
+            page.on('request', req => {
+              const type = req.resourceType();
+              if (["image", "stylesheet", "font"].includes(type)) req.abort();
+              else req.continue();
+            });
 
-          const features = await tryScan(page, scraperApiUrl, false, userAgent);
-          await delay(1000 + Math.random() * 500);
-          await page.close();
+            const features = await tryScan(page, scraperApiUrl, false, userAgent);
+            await delay(1000 + Math.random() * 500);
+            await page.close();
 
-          return {
-            features,
-            finalUrl: url,
-            sslBypassUsed: 0,
-            usedProxy: true,
-            userAgent
-          };
-        } catch (err) {
-          errorMsgs.push(`ScraperAPI (fallback): ${err.message} at ${url}`);
-        } finally {
-          if (page) await page.close().catch(() => {});
+            result = {
+              features,
+              finalUrl: url,
+              sslBypassUsed: 0,
+              usedProxy: true,
+              userAgent
+            };
+          } catch (err) {
+            errorMsgs.push(`ScraperAPI (fallback): ${err.message}`);
+          } finally {
+            if (page) await page.close().catch(() => {});
+          }
         }
-      }
+      });
     }
 
     throw new Error(errorMsgs.map(msg => `- ${msg}`).join('\n'));
@@ -371,9 +381,10 @@ export const scanUrls = async (urls, concurrencyLimit = 7) => {
         };
         console.log(`✅ Scanned: ${url}`);
       } catch (err) {
-        console.error(`❌ Error scanning ${url}: ${err.message}`);
-        results[url] = { error: err.message, label };
-        errorLog.push({ url, error: err.message });
+        console.error(`❌ Failed URL: ${url}`);
+        console.error(`   ↳ Error: ${err.message}`);
+        results[url] = {error: err.message, finalUrlTried: url,label};
+        errorLog.push({url,error: err.message});
       }
     })
   );
