@@ -315,7 +315,7 @@ export const scanUrls = async (urls, concurrencyLimit = 10) => {
         };
 
       } catch (err) {
-        errorMsgs.push(`${sslBypass ? 'SSL Bypass' : 'Try'}: ${err.message} at ${url}`);
+        errorMsgs.push(`${sslBypass ? 'SSL Bypass' : 'Try'}: ${err.message}`);
         if (err.message.includes('Protocol error: Connection closed.')) {
           console.warn(`🔁 Relaunching browser due to closed connection at ${url}`);
           await delay(3000);
