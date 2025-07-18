@@ -289,6 +289,7 @@ export const scanUrls = async (urls, concurrencyLimit = 10) => {
     let userAgent = new UserAgent().toString();
     let errorMsgs = [];
     let proxyNeeded = false;
+    let result;
 
     for (let { url, sslBypass } of versions) {
       let page;
@@ -327,7 +328,7 @@ export const scanUrls = async (urls, concurrencyLimit = 10) => {
         if (page) await page.close().catch(() => {});
       }
     }
-
+    
     if (proxyNeeded) {
       console.warn(`🌐 Retrying ${originalUrl} using ScraperAPI URL proxy`);
 
@@ -364,7 +365,8 @@ export const scanUrls = async (urls, concurrencyLimit = 10) => {
         }
       });
     }
-
+    
+    if (result) return result;
     throw new Error(errorMsgs.map(msg => `- ${msg}`).join('\n'));
   }
 
