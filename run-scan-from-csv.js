@@ -2,7 +2,7 @@
 import path from 'path';
 import fsSync from 'fs';
 import { fileURLToPath } from 'url';
-import { scanUrls } from './scanner.js';
+import { scanUrls } from './scanner_add.js';
 import {
   readUrlsFromCsv,
   writeResultsToCsv,
